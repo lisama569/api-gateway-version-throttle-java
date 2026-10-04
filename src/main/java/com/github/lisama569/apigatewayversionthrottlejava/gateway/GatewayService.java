@@ -5,18 +5,29 @@ import com.github.lisama569.apigatewayversionthrottlejava.gateway.handler.Handle
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.ApiError;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.GatewayRequest;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.GatewayResponse;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.resilience.BackendInvoker;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.resilience.CircuitBreakerProperties;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.resilience.RouteCircuitBreaker;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.resilience.TimeoutProperties;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.route.VersionRouter;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.throttle.TenantRateLimiter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.Map;
+import java.util.concurrent.TimeoutException;
 
 /**
- * 网关编排：版本路由 -> 租户限流 -> 后端调用 -> 异常归一化。
- * <p>额度纪律：版本/路由不支持的请求在限流之前被拒绝，不占用额度；
- * 限流拒绝的请求从未获得额度；后端调用失败的请求立即归还额度。
+ * 网关编排：版本路由 -> 快速失败检查 -> 租户限流 -> 限时后端调用 -> 异常归一化。
+ * <p>额度纪律：
+ * <ul>
+ *   <li>版本/路由不支持的请求在限流之前被拒绝，不占用额度；</li>
+ *   <li>熔断器 OPEN 期间的快速失败不经过后端、也不占用额度；</li>
+ *   <li>被限流拒绝的请求从未获得额度；</li>
+ *   <li>后端调用失败/超时的请求通过窗口标记的 Permit 幂等归还额度，不多还、不漏还。</li>
+ * </ul>
  */
 @Service
 public class GatewayService {
@@ -27,12 +38,32 @@ public class GatewayService {
     private final VersionRouter versionRouter;
     private final TenantRateLimiter rateLimiter;
     private final ErrorNormalizer errorNormalizer;
+    private final BackendInvoker backendInvoker;
+    private final RouteCircuitBreaker circuitBreaker;
 
+    /** 完整构造：启用响应时间上限与快速失败。 */
+    @Autowired
     public GatewayService(VersionRouter versionRouter, TenantRateLimiter rateLimiter,
-                          ErrorNormalizer errorNormalizer) {
+                          ErrorNormalizer errorNormalizer, BackendInvoker backendInvoker,
+                          RouteCircuitBreaker circuitBreaker) {
         this.versionRouter = versionRouter;
         this.rateLimiter = rateLimiter;
         this.errorNormalizer = errorNormalizer;
+        this.backendInvoker = backendInvoker;
+        this.circuitBreaker = circuitBreaker;
+    }
+
+    /** 兼容构造：不启用快速失败，并使用宽松的默认响应时间上限（供既有装配复用）。 */
+    public GatewayService(VersionRouter versionRouter, TenantRateLimiter rateLimiter,
+                          ErrorNormalizer errorNormalizer) {
+        this(versionRouter, rateLimiter, errorNormalizer,
+                new BackendInvoker(new TimeoutProperties()),
+                new RouteCircuitBreaker(new CircuitBreakerProperties()) {
+                    @Override
+                    public CheckResult check(String tenantId, String route) {
+                        return new CheckResult(true, 0L);
+                    }
+                });
     }
 
     public GatewayResponse dispatch(GatewayRequest request) {
@@ -46,7 +77,17 @@ public class GatewayService {
         log.info("route decision: route={}, version={} -> versionUsed={}, deprecated={}",
                 request.route(), request.version(), versionUsed, registration.deprecated());
 
-        if (!rateLimiter.tryAcquire(tenantId)) {
+        RouteCircuitBreaker.CheckResult breaker = circuitBreaker.check(tenantId, request.route());
+        if (!breaker.allowed()) {
+            throw new GatewayException(ApiError.CIRCUIT_OPEN,
+                    "backend temporarily unavailable due to repeated timeouts, please retry later",
+                    true, versionUsed,
+                    Map.of("tenantId", tenantId, "route", request.route(),
+                            "retryAfterMillis", breaker.retryAfterMillis()));
+        }
+
+        TenantRateLimiter.Permit permit = rateLimiter.tryAcquire(tenantId);
+        if (permit == null) {
             log.info("throttle decision: tenantId={} rejected, remainingCapacity=0", tenantId);
             throw new GatewayException(ApiError.RATE_LIMITED,
                     "tenant rate limit exceeded", true, versionUsed,
@@ -55,14 +96,20 @@ public class GatewayService {
         log.info("throttle decision: tenantId={} admitted, remainingCapacity={}",
                 tenantId, rateLimiter.remainingCapacity(tenantId));
 
+        long timeoutMillis = backendInvoker.resolveTimeout(request.route());
+        long startNanos = System.nanoTime();
         try {
-            Object data = registration.handler().handle(request);
+            Object data = backendInvoker.invoke(registration.handler(), request, timeoutMillis);
+            circuitBreaker.record(tenantId, request.route(), false);
             return GatewayResponse.ok(versionUsed, registration.deprecated(), data);
         } catch (Throwable t) {
-            rateLimiter.release(tenantId);
+            rateLimiter.release(permit);
+            boolean timedOut = t instanceof TimeoutException;
+            circuitBreaker.record(tenantId, request.route(), timedOut);
             GatewayException normalized = errorNormalizer.normalize(t, versionUsed);
-            log.info("failure normalized: tenantId={}, versionUsed={}, error={}, retryable={}",
-                    tenantId, versionUsed, normalized.getError(), normalized.isRetryable());
+            long elapsedMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+            log.info("failure normalized: tenantId={}, versionUsed={}, error={}, retryable={}, elapsedMillis={}, quotaReturned=true",
+                    tenantId, versionUsed, normalized.getError(), normalized.isRetryable(), elapsedMillis);
             throw normalized;
         }
     }

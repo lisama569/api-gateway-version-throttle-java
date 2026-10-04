@@ -23,6 +23,7 @@ public class GatewayExceptionAdvice {
             case BUSINESS_REJECTED -> HttpStatus.UNPROCESSABLE_ENTITY;
             case BACKEND_TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
             case BACKEND_INTERNAL_ERROR -> HttpStatus.BAD_GATEWAY;
+            case CIRCUIT_OPEN -> HttpStatus.SERVICE_UNAVAILABLE;
         };
         return ResponseEntity.status(status).body(GatewayResponse.rejected(
                 ex.getError(), ex.getMessage(), ex.isRetryable(), ex.getVersionUsed(), ex.getDetail()));
