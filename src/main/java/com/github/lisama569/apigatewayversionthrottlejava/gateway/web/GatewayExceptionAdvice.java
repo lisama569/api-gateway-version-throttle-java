@@ -20,6 +20,7 @@ public class GatewayExceptionAdvice {
             case UNSUPPORTED_VERSION -> HttpStatus.BAD_REQUEST;
             case UNKNOWN_ROUTE -> HttpStatus.NOT_FOUND;
             case RATE_LIMITED -> HttpStatus.TOO_MANY_REQUESTS;
+            case CIRCUIT_OPEN -> HttpStatus.SERVICE_UNAVAILABLE;
             case BUSINESS_REJECTED -> HttpStatus.UNPROCESSABLE_ENTITY;
             case BACKEND_TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
             case BACKEND_INTERNAL_ERROR -> HttpStatus.BAD_GATEWAY;

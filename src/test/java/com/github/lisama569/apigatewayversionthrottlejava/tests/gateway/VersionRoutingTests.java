@@ -12,7 +12,11 @@ import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.ApiVersi
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.GatewayRequest;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.GatewayResponse;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.route.VersionRouter;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.circuit.TenantCircuitBreaker;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.config.CircuitBreakerProperties;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.config.TimeoutProperties;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.throttle.TenantRateLimiter;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.timeout.BackendInvoker;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -44,7 +48,10 @@ class VersionRoutingTests {
         TenantRateLimiter limiter = new TenantRateLimiter(props);
 
         this.gatewayService = new GatewayService(
-                new VersionRouter(registry), limiter, new ErrorNormalizer());
+                new VersionRouter(registry), limiter, new ErrorNormalizer(),
+                new BackendInvoker(),
+                new TenantCircuitBreaker(new CircuitBreakerProperties()),
+                new TimeoutProperties());
     }
 
     @Test

@@ -10,7 +10,11 @@ import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.ApiError
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.ApiVersion;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.model.GatewayRequest;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.route.VersionRouter;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.circuit.TenantCircuitBreaker;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.config.CircuitBreakerProperties;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.config.TimeoutProperties;
 import com.github.lisama569.apigatewayversionthrottlejava.gateway.throttle.TenantRateLimiter;
+import com.github.lisama569.apigatewayversionthrottlejava.gateway.timeout.BackendInvoker;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -49,7 +53,10 @@ class FailureNormalizationTests {
         props.setTenantLimits(Map.of());
 
         this.gatewayService = new GatewayService(
-                new VersionRouter(registry), new TenantRateLimiter(props), new ErrorNormalizer());
+                new VersionRouter(registry), new TenantRateLimiter(props), new ErrorNormalizer(),
+                new BackendInvoker(),
+                new TenantCircuitBreaker(new CircuitBreakerProperties()),
+                new TimeoutProperties());
     }
 
     private GatewayException dispatch(String route, String tenant) {

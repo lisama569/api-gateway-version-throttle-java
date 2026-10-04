@@ -1,4 +1,4 @@
-# API 网关层（版本路由 + 租户限流 + 故障归一化）
+# API 网关层（版本路由 + 租户限流 + 故障归一化 + 响应时限 + 快速失败）
 
 本地运行的 Spring Boot 网关层，对外提供统一入口 `POST /gw/dispatch`，
 在并发场景下保证版本路由、租户限流与后端故障处理的结果一致且可解释。
@@ -42,9 +42,31 @@
 - 额度纪律：
   - 版本/路由不支持的请求在限流之前被拒绝，**不占用额度**；
   - 被限流拒绝的请求**从未获得额度**；
-  - 后端调用失败/被拒绝的请求立即**归还额度**（`release`），不占用本应释放的额度。
+  - 后端调用失败/被拒绝的请求立即**归还额度**（`release`），不占用本应释放的额度；
+  - 超过响应时间上限的请求同样立即归还额度，并发超时场景下不多还、不漏还，
+    后续放行量与实际成功量严格对齐；
+  - 熔断快速失败（`CIRCUIT_OPEN`）发生在限流之前，不占用额度。
 - 限流拒绝返回 `RATE_LIMITED`（HTTP 429），`retryable=true` 提示可重试，
   `detail` 携带租户与剩余额度信息。
+
+## 响应时间上限
+
+- 每个请求都有响应时间上限：全局默认值 `gateway.timeout.default-millis` 对所有路由生效，
+  个别路由可用 `gateway.timeout.route-overrides.<route>` 单独覆盖（覆盖优先于全局默认）。
+- 后端调用在独立虚拟线程中执行，网关只在约定时限内等待结果；超过时限未返回即取消执行，
+  按 `BACKEND_TIMEOUT`（HTTP 504，retryable=true）结束，**不会无限期挂在网关里**。
+- 虚拟线程按任务创建，不受平台线程池容量限制：大批请求同时打到卡住的后端时，
+  每一个都能在各自的时限内结束。
+- 超时与后端主动抛 `TimeoutException` 走同一条归一化路径，对外错误类别一致、可区分。
+
+## 快速失败（熔断）
+
+- 维度：按「租户 + 路由」独立判定，互不影响。
+- 触发：同一租户在同一路由上**连续超时**达到 `gateway.circuit.failure-threshold` 次，
+  网关进入 `gateway.circuit.open-millis` 毫秒的保护期；期间任何成功调用都会把连续计数清零。
+- 保护期内：请求在限流之前被直接挡下，返回 `CIRCUIT_OPEN`（HTTP 503，retryable=true），
+  `detail.retryAfterMillis` 提示多久之后可以再试；**不消耗限流额度**，流量不再打到已卡住的后端。
+- 恢复：保护期结束后自动恢复闭合，无需人工干预；恢复后该放行的请求照常放行。
 
 ## 错误分类（归一化）
 
@@ -55,8 +77,9 @@
 | `UNSUPPORTED_VERSION` | 版本字符串无法识别 / 路由不支持该版本 | 400 | false |
 | `UNKNOWN_ROUTE` | 路由未注册 | 404 | false |
 | `RATE_LIMITED` | 租户窗口内额度耗尽 | 429 | true |
+| `CIRCUIT_OPEN` | 连续超时触发快速失败，保护期内挡流 | 503 | true |
 | `BUSINESS_REJECTED` | 后端抛出 `BusinessRejectionException` | 422 | false |
-| `BACKEND_TIMEOUT` | 后端抛出 `TimeoutException` | 504 | true |
+| `BACKEND_TIMEOUT` | 后端超过响应时间上限未返回 / 抛出 `TimeoutException` | 504 | true |
 | `BACKEND_INTERNAL_ERROR` | 其他未识别异常 | 502 | true |
 
 内部错误的对外文案固定为通用语句，原始异常内容（连接串、堆栈等）只记录在服务端日志。
@@ -68,6 +91,43 @@
 | `gateway.throttle.default-limit` | 10 | 每租户每窗口默认放行量 |
 | `gateway.throttle.window-millis` | 60000 | 限流窗口时长（毫秒） |
 | `gateway.throttle.tenant-limits.<tenantId>` | — | 指定租户的单独额度，覆盖默认值 |
+| `gateway.timeout.default-millis` | 2000 | 全局默认响应时间上限（毫秒） |
+| `gateway.timeout.route-overrides.<route>` | — | 指定路由的响应时间上限，覆盖全局默认 |
+| `gateway.circuit.failure-threshold` | 3 | 触发快速失败所需的连续超时次数 |
+| `gateway.circuit.open-millis` | 30000 | 快速失败保护期时长（毫秒），到期自动恢复 |
+
+## 兼容范围
+
+- **版本维度**：响应时间上限与快速失败对所有已注册版本（含已弃用的 `v1` 与当前 `v2`）
+  一致生效；超时上限按路由名配置，与该路由命中的版本无关。版本不支持 / 未知路由的请求
+  在超时与熔断判定之前就被拒绝，行为不变。
+- **租户维度**：限流额度、熔断状态都按 `tenantId` 隔离，互不影响；
+  缺省租户归入 `anonymous`，同样受超时上限与熔断规则约束。
+- **配置兼容**：新增配置项均有默认值，不配置时行为为「全局 2s 超时上限 +
+  连续 3 次超时熔断 30s」；既有 `gateway.throttle.*` 配置语义不变。
+
+## 本地验证
+
+```bash
+mvn test          # 全量用例（含版本路由、限流、故障归一化回归）
+mvn test -Dtest=ResponseTimeoutTests        # 只看响应时间上限
+mvn test -Dtest=TimeoutQuotaAccountingTests # 只看并发超时下的额度账
+mvn test -Dtest=CircuitBreakerTests         # 只看快速失败与自动恢复
+```
+
+手动验证（本地启动后）：
+
+```bash
+mvn spring-boot:run -Dspring-boot.run.arguments=--server.port=8080
+# 正常请求（默认配置 server.port=0 为随机端口，手动验证时显式指定）
+curl -X POST localhost:8080/gw/dispatch -H 'Content-Type: application/json' \
+  -d '{"tenantId":"t1","route":"echo","version":"v2","payload":"hi"}'
+```
+
+调整 `gateway.timeout.default-millis` 为较小值（如 1ms）即可观察到
+`BACKEND_TIMEOUT`；连续超时达到 `gateway.circuit.failure-threshold` 后可观察到
+`CIRCUIT_OPEN` 及 `detail.retryAfterMillis`，等待 `gateway.circuit.open-millis`
+后自动恢复。
 
 ## 测试
 
@@ -80,6 +140,12 @@ mvn test
   业务失败归还额度、租户间隔离。
 - `FailureNormalizationTests`：超时 / 内部错误 / 业务拒绝映射为可区分类别，
   原始异常不透出。
+- `ResponseTimeoutTests`：后端真实卡住（不抛异常、永不返回）时按全局默认/路由覆盖的
+  时限结束并返回 `BACKEND_TIMEOUT`；30 个并发卡住请求每一个都按时结束。
+- `TimeoutQuotaAccountingTests`：正常与超时请求混杂并发下额度账自洽——
+  超时额度恰好归还，后续放行量与归还量一致，不误限也不超发。
+- `CircuitBreakerTests`：连续超时触发 `CIRCUIT_OPEN` 并携带 `retryAfterMillis`，
+  保护期内不再打到后端、不占额度，保护期结束自动恢复，熔断按租户隔离。
 
 所有单测日志均打印请求输入（tenantId/route/version/payload）与判定依据
 （路由决策、限流计数、归一化结果），失败原因可通过 `errorCode` 区分。
