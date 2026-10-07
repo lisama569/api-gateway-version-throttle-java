@@ -66,7 +66,8 @@ public class GatewayService {
                             "retryAfterMillis", retryAfter));
         }
 
-        if (!rateLimiter.tryAcquire(tenantId)) {
+        TenantRateLimiter.Permit permit = rateLimiter.tryAcquire(tenantId);
+        if (permit == null) {
             log.info("throttle decision: tenantId={} rejected, remainingCapacity=0", tenantId);
             throw new GatewayException(ApiError.RATE_LIMITED,
                     "tenant rate limit exceeded", true, versionUsed,
@@ -86,7 +87,8 @@ public class GatewayService {
             circuitBreaker.onSuccess(tenantId, request.route());
             return GatewayResponse.ok(versionUsed, registration.deprecated(), data);
         } catch (Throwable t) {
-            rateLimiter.release(tenantId);
+            // 归还凭证绑定原窗口且最多生效一次：跨窗口结束不会污染新窗口，乱序/重复不会多还
+            rateLimiter.release(permit);
             GatewayException normalized = errorNormalizer.normalize(t, versionUsed);
             if (normalized.getError() == ApiError.BACKEND_TIMEOUT) {
                 circuitBreaker.onTimeout(tenantId, request.route());

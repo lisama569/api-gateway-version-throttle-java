@@ -15,11 +15,16 @@ public class CircuitBreakerProperties {
     /** 触发快速失败所需的连续超时次数。 */
     private int failureThreshold = 3;
 
-    /** 快速失败保护期时长（毫秒），到期后自动恢复放行。 */
+    /** 快速失败保护期时长（毫秒），到期后进入试探阶段。 */
     private long openMillis = 30_000L;
+
+    /** 保护期结束后允许同时放行的试探请求数；试探超时立即重新进入保护期。 */
+    private int halfOpenProbeCount = 1;
 
     public int getFailureThreshold() { return failureThreshold; }
     public void setFailureThreshold(int failureThreshold) { this.failureThreshold = failureThreshold; }
     public long getOpenMillis() { return openMillis; }
     public void setOpenMillis(long openMillis) { this.openMillis = openMillis; }
+    public int getHalfOpenProbeCount() { return halfOpenProbeCount; }
+    public void setHalfOpenProbeCount(int halfOpenProbeCount) { this.halfOpenProbeCount = halfOpenProbeCount; }
 }
