@@ -19,7 +19,8 @@ import java.util.Map;
 /**
  * 网关编排：版本路由 -> 快速失败检查 -> 租户限流 -> 限时后端调用 -> 异常归一化。
  * <p>额度纪律：版本/路由不支持、熔断快速失败的请求在限流之前被拒绝，不占用额度；
- * 限流拒绝的请求从未获得额度；后端调用失败（含超时）的请求立即归还额度。
+ * 限流拒绝的请求从未获得额度；后端调用失败（含超时）的请求通过其持有的额度租约归还——
+ * 每份租约至多归还一次，且跨窗口结束的请求只归还到申请时的旧窗口，不影响新窗口的放行量。
  */
 @Service
 public class GatewayService {
@@ -57,16 +58,19 @@ public class GatewayService {
                 request.route(), request.version(), versionUsed, registration.deprecated());
 
         if (!circuitBreaker.tryPass(tenantId, request.route())) {
+            boolean probing = circuitBreaker.isHalfOpen(tenantId, request.route());
             long retryAfter = circuitBreaker.retryAfterMillis(tenantId, request.route());
-            log.info("circuit decision: tenantId={}, route={} fast-fail, retryAfterMillis={}",
-                    tenantId, request.route(), retryAfter);
+            log.info("circuit decision: tenantId={}, route={} fast-fail, halfOpenProbing={}, retryAfterMillis={}",
+                    tenantId, request.route(), probing, retryAfter);
             throw new GatewayException(ApiError.CIRCUIT_OPEN,
                     "backend unstable, fast-failing", true, versionUsed,
                     Map.of("tenantId", tenantId, "route", request.route(),
-                            "retryAfterMillis", retryAfter));
+                            "retryAfterMillis", retryAfter,
+                            "halfOpenProbing", probing));
         }
 
-        if (!rateLimiter.tryAcquire(tenantId)) {
+        TenantRateLimiter.Lease lease = rateLimiter.tryAcquire(tenantId);
+        if (lease == null) {
             log.info("throttle decision: tenantId={} rejected, remainingCapacity=0", tenantId);
             throw new GatewayException(ApiError.RATE_LIMITED,
                     "tenant rate limit exceeded", true, versionUsed,
@@ -86,10 +90,13 @@ public class GatewayService {
             circuitBreaker.onSuccess(tenantId, request.route());
             return GatewayResponse.ok(versionUsed, registration.deprecated(), data);
         } catch (Throwable t) {
-            rateLimiter.release(tenantId);
+            lease.release();
             GatewayException normalized = errorNormalizer.normalize(t, versionUsed);
             if (normalized.getError() == ApiError.BACKEND_TIMEOUT) {
                 circuitBreaker.onTimeout(tenantId, request.route());
+            } else {
+                // 时限内返回了非超时结果（业务拒绝/内部错误等），说明后端并未卡住
+                circuitBreaker.onNonTimeoutResult(tenantId, request.route());
             }
             log.info("failure normalized: tenantId={}, versionUsed={}, error={}, retryable={}",
                     tenantId, versionUsed, normalized.getError(), normalized.isRetryable());
